@@ -19,8 +19,10 @@ import androidx.health.connect.client.records.BodyTemperatureMeasurementLocation
 import androidx.health.connect.client.records.BodyTemperatureRecord
 import androidx.health.connect.client.records.BodyWaterMassRecord
 import androidx.health.connect.client.records.BoneMassRecord
+import androidx.health.connect.client.records.CyclingPedalingCadenceRecord
 import androidx.health.connect.client.records.DistanceRecord
 import androidx.health.connect.client.records.ElevationGainedRecord
+import androidx.health.connect.client.records.ExerciseSessionRecord
 import androidx.health.connect.client.records.FloorsClimbedRecord
 import androidx.health.connect.client.records.HeartRateRecord
 import androidx.health.connect.client.records.HeartRateVariabilityRmssdRecord
@@ -29,10 +31,12 @@ import androidx.health.connect.client.records.HydrationRecord
 import androidx.health.connect.client.records.LeanBodyMassRecord
 import androidx.health.connect.client.records.MealType
 import androidx.health.connect.client.records.OxygenSaturationRecord
+import androidx.health.connect.client.records.PowerRecord
 import androidx.health.connect.client.records.Record
 import androidx.health.connect.client.records.RespiratoryRateRecord
 import androidx.health.connect.client.records.RestingHeartRateRecord
 import androidx.health.connect.client.records.SleepSessionRecord
+import androidx.health.connect.client.records.SpeedRecord
 import androidx.health.connect.client.records.StepsRecord
 import androidx.health.connect.client.records.TotalCaloriesBurnedRecord
 import androidx.health.connect.client.records.Vo2MaxRecord
@@ -45,6 +49,8 @@ import io.homeassistant.companion.android.common.R as commonR
 import io.homeassistant.companion.android.common.sensors.SensorManager
 import io.homeassistant.companion.android.common.util.FailFast
 import io.homeassistant.companion.android.common.util.STATE_UNKNOWN
+import io.homeassistant.companion.android.sensors.healthconnect.HealthConnectDataType
+import io.homeassistant.companion.android.sensors.healthconnect.HealthConnectExerciseTypes
 import java.math.BigDecimal
 import java.math.RoundingMode
 import java.time.Instant
@@ -52,6 +58,7 @@ import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.LocalTime
 import java.time.temporal.ChronoUnit
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.reflect.KClass
 import kotlin.time.DurationUnit
 import kotlin.time.toDuration
@@ -182,6 +189,15 @@ class HealthConnectSensorManager : SensorManager {
             deviceClass = "distance",
             unitOfMeasurement = "m",
             stateClass = SensorManager.STATE_CLASS_TOTAL_INCREASING,
+            entityCategory = SensorManager.ENTITY_CATEGORY_DIAGNOSTIC,
+        )
+
+        val exerciseSession = SensorManager.BasicSensor(
+            id = "health_connect_exercise_session",
+            type = "sensor",
+            commonR.string.basic_sensor_name_exercise_session,
+            commonR.string.sensor_description_exercise_session,
+            "mdi:run",
             entityCategory = SensorManager.ENTITY_CATEGORY_DIAGNOSTIC,
         )
 
@@ -347,34 +363,23 @@ class HealthConnectSensorManager : SensorManager {
             deviceClass = "weight",
         )
 
-        private val sensorPermissionMap = mapOf(
-            activeCaloriesBurned.id to ActiveCaloriesBurnedRecord::class,
-            basalBodyTemperature.id to BasalBodyTemperatureRecord::class,
-            basalMetabolicRate.id to BasalMetabolicRateRecord::class,
-            bloodGlucose.id to BloodGlucoseRecord::class,
-            bodyFat.id to BodyFatRecord::class,
-            bodyWaterMass.id to BodyWaterMassRecord::class,
-            bodyTemperature.id to BodyTemperatureRecord::class,
-            boneMass.id to BoneMassRecord::class,
-            diastolicBloodPressure.id to BloodPressureRecord::class,
-            distance.id to DistanceRecord::class,
-            elevationGained.id to ElevationGainedRecord::class,
-            floorsClimbed.id to FloorsClimbedRecord::class,
-            heartRate.id to HeartRateRecord::class,
-            heartRateVariability.id to HeartRateVariabilityRmssdRecord::class,
-            height.id to HeightRecord::class,
-            hydration.id to HydrationRecord::class,
-            leanBodyMass.id to LeanBodyMassRecord::class,
-            oxygenSaturation.id to OxygenSaturationRecord::class,
-            respiratoryRate.id to RespiratoryRateRecord::class,
-            restingHeartRate.id to RestingHeartRateRecord::class,
-            sleepDuration.id to SleepSessionRecord::class,
-            steps.id to StepsRecord::class,
-            systolicBloodPressure.id to BloodPressureRecord::class,
-            totalCaloriesBurned.id to TotalCaloriesBurnedRecord::class,
-            vo2Max.id to Vo2MaxRecord::class,
-            weight.id to WeightRecord::class,
-        )
+        /**
+         * Toggle setting key for "allow Home Assistant to write to this Health Connect data type".
+         * One row per sensor; when ON, [requiredPermissions] for that sensor includes the
+         * matching `WRITE_*` permission so the existing grant flow asks the user for it.
+         */
+        const val SETTING_ALLOW_WRITES = "sensor_allow_writes"
+
+        /**
+         * Per-sensor cache of the [SETTING_ALLOW_WRITES] toggle, populated during
+         * [requestSensorUpdate] (which runs on the WorkManager IO dispatcher and again
+         * synchronously from `setSetting`). [requiredPermissions] is non-suspend by
+         * interface contract, so it cannot read the DB itself — caching keeps the call
+         * site cheap without forcing every sensor manager in the codebase to become
+         * suspend.
+         */
+        @androidx.annotation.VisibleForTesting
+        internal val allowWritesCache = ConcurrentHashMap<String, Boolean>()
     }
 
     override val name: Int
@@ -382,15 +387,19 @@ class HealthConnectSensorManager : SensorManager {
 
     override fun requiredPermissions(context: Context, sensorId: String): Array<String> {
         return FailFast.failOnCatch({ "Unable to get required permissions for $sensorId" }, emptyArray<String>()) {
-            val permissions = sensorPermissionMap[sensorId]?.let { recordClass ->
-                val readPermission = HealthPermission.getReadPermission(recordClass)
-                if (getOrCreateHealthConnectClient(context)?.features
+            val permissions = HealthConnectDataType.fromSensorId(sensorId)?.let { dataType ->
+                val base = if (getOrCreateHealthConnectClient(context)?.features
                         ?.getFeatureStatus(HealthConnectFeatures.FEATURE_READ_HEALTH_DATA_IN_BACKGROUND)
                     == HealthConnectFeatures.FEATURE_STATUS_AVAILABLE
                 ) {
-                    arrayOf(readPermission, HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND)
+                    arrayOf(dataType.readPermission, HealthPermission.PERMISSION_READ_HEALTH_DATA_IN_BACKGROUND)
                 } else {
-                    arrayOf(readPermission)
+                    arrayOf(dataType.readPermission)
+                }
+                if (allowWritesCache[sensorId] == true) {
+                    base + dataType.writePermission
+                } else {
+                    base
                 }
             }
             FailFast.failWhen(permissions == null) { "Missing sensor mapping for $sensorId" }
@@ -399,6 +408,7 @@ class HealthConnectSensorManager : SensorManager {
     }
 
     override suspend fun requestSensorUpdate(context: Context) {
+        refreshAllowWritesCache(context)
         if (isEnabled(context, activeCaloriesBurned)) {
             updateActiveCaloriesBurnedSensor(context)
         }
@@ -431,6 +441,9 @@ class HealthConnectSensorManager : SensorManager {
         }
         if (isEnabled(context, elevationGained)) {
             updateElevationGainedSensor(context)
+        }
+        if (isEnabled(context, exerciseSession)) {
+            updateExerciseSessionSensor(context)
         }
         if (isEnabled(context, floorsClimbed)) {
             updateFloorsClimbedSensor(context)
@@ -476,6 +489,28 @@ class HealthConnectSensorManager : SensorManager {
         }
         if (isEnabled(context, weight)) {
             updateWeightSensor(context)
+        }
+    }
+
+    /**
+     * Persist a default-OFF [SETTING_ALLOW_WRITES] toggle for every available HC sensor and
+     * mirror the current values into [allowWritesCache]. Called at the top of
+     * [requestSensorUpdate] so that:
+     *  - the row exists in the DB and shows up in the sensor detail screen the first time
+     *    a user opens it after enabling the sensor, and
+     *  - [requiredPermissions] sees the latest user choice within one update cycle of a
+     *    toggle flip (which is fine — `setSetting` triggers a sensor update right after
+     *    writing the row, so the cache is fresh before the user's next interaction).
+     */
+    private suspend fun refreshAllowWritesCache(context: Context) {
+        getAvailableSensors(context).forEach { basicSensor ->
+            val enabled = getToggleSetting(
+                context,
+                basicSensor,
+                SETTING_ALLOW_WRITES,
+                default = false,
+            )
+            allowWritesCache[basicSensor.id] = enabled
         }
     }
 
@@ -688,6 +723,157 @@ class HealthConnectSensorManager : SensorManager {
             elevationValue,
             elevationGained.statelessIcon,
             attributes = buildAggregationAttributes(elevationGainedRequest),
+        )
+    }
+
+    /**
+     * Surfaces the most-recent [ExerciseSessionRecord] (within the last 30 days, like the
+     * other read sensors) as a single sensor whose state is the exercise type slug
+     * ("running", "biking", …) and whose attributes carry the workout's start/end/duration
+     * plus optional title/notes. The Wear OS activity sensor is a better fit for live
+     * workout state — this one's main purpose is letting HA see *that* a workout was logged
+     * (by HC, by the wearable app, by HA itself via a write) so dashboards and automations
+     * can react after the fact.
+     */
+    private suspend fun updateExerciseSessionSensor(context: Context) {
+        val healthConnectClient = getOrCreateHealthConnectClient(context) ?: return
+        val request = buildReadRecordsRequest(ExerciseSessionRecord::class)
+        val response = healthConnectClient.readRecordsOrNull(request) ?: return
+        val record = response.records.lastOrNull() ?: return
+        val durationMillis = record.endTime.toEpochMilli() - record.startTime.toEpochMilli()
+        val durationMinutes = durationMillis.toDuration(DurationUnit.MILLISECONDS).inWholeMinutes
+        val durationSeconds = durationMillis.toDuration(DurationUnit.MILLISECONDS).inWholeSeconds
+        val typeSlug = HealthConnectExerciseTypes.INT_TO_SLUG[record.exerciseType] ?: STATE_UNKNOWN
+        val sessionRange = TimeRangeFilter.between(record.startTime, record.endTime)
+
+        val attributes = buildMap<String, Any?> {
+            put("exercise_type", typeSlug)
+            put("exercise_type_int", record.exerciseType)
+            put("start_time", record.startTime)
+            put("end_time", record.endTime)
+            put("duration_minutes", durationMinutes)
+            put("duration_seconds", durationSeconds)
+            put("title", record.title)
+            put("notes", record.notes)
+            put("source", record.metadata.dataOrigin.packageName)
+
+            // Inline session data (always present, no extra HC call needed).
+            put("segment_count", record.segments.size)
+            put("lap_count", record.laps.size)
+            if (record.segments.isNotEmpty()) {
+                put(
+                    "segments",
+                    record.segments.map { seg ->
+                        mapOf(
+                            "start_time" to seg.startTime,
+                            "end_time" to seg.endTime,
+                            "segment_type" to seg.segmentType,
+                            "repetitions" to seg.repetitions,
+                        )
+                    },
+                )
+                // Sum repetitions across segments — for swims this is total strokes/lengths.
+                put("total_segment_repetitions", record.segments.sumOf { it.repetitions })
+            }
+            if (record.laps.isNotEmpty()) {
+                val lapDistanceMeters = record.laps.sumOf { it.length?.inMeters ?: 0.0 }
+                put("total_lap_distance_m", lapDistanceMeters)
+            }
+
+            // Aggregate over the session window. Each block runs independently — a missing
+            // permission or empty record set silently drops only its own attributes.
+            val hr = healthConnectClient.aggregateOrNull(
+                AggregateRequest(
+                    metrics = setOf(
+                        HeartRateRecord.BPM_AVG,
+                        HeartRateRecord.BPM_MIN,
+                        HeartRateRecord.BPM_MAX,
+                    ),
+                    timeRangeFilter = sessionRange,
+                ),
+            )
+            hr?.get(HeartRateRecord.BPM_AVG)?.let { put("avg_hr", it) }
+            hr?.get(HeartRateRecord.BPM_MIN)?.let { put("min_hr", it) }
+            hr?.get(HeartRateRecord.BPM_MAX)?.let { put("max_hr", it) }
+
+            val distance = healthConnectClient.aggregateOrNull(
+                AggregateRequest(
+                    metrics = setOf(DistanceRecord.DISTANCE_TOTAL),
+                    timeRangeFilter = sessionRange,
+                ),
+            )?.get(DistanceRecord.DISTANCE_TOTAL)?.inMeters
+            distance?.let {
+                put("total_distance_m", it)
+                if (durationSeconds > 0 && it > 0) {
+                    put("avg_speed_m_s", it / durationSeconds.toDouble())
+                    put("avg_pace_min_per_km", durationMinutes.toDouble() / (it / 1000.0))
+                }
+            }
+
+            val speed = healthConnectClient.aggregateOrNull(
+                AggregateRequest(
+                    metrics = setOf(SpeedRecord.SPEED_AVG, SpeedRecord.SPEED_MAX),
+                    timeRangeFilter = sessionRange,
+                ),
+            )
+            speed?.get(SpeedRecord.SPEED_AVG)?.inMetersPerSecond?.let { put("recorded_avg_speed_m_s", it) }
+            speed?.get(SpeedRecord.SPEED_MAX)?.inMetersPerSecond?.let { put("recorded_max_speed_m_s", it) }
+
+            val power = healthConnectClient.aggregateOrNull(
+                AggregateRequest(
+                    metrics = setOf(PowerRecord.POWER_AVG, PowerRecord.POWER_MAX),
+                    timeRangeFilter = sessionRange,
+                ),
+            )
+            power?.get(PowerRecord.POWER_AVG)?.inWatts?.let { put("avg_power_watts", it) }
+            power?.get(PowerRecord.POWER_MAX)?.inWatts?.let { put("max_power_watts", it) }
+
+            val cadence = healthConnectClient.aggregateOrNull(
+                AggregateRequest(
+                    metrics = setOf(
+                        CyclingPedalingCadenceRecord.RPM_AVG,
+                        CyclingPedalingCadenceRecord.RPM_MAX,
+                    ),
+                    timeRangeFilter = sessionRange,
+                ),
+            )
+            cadence?.get(CyclingPedalingCadenceRecord.RPM_AVG)?.let { put("avg_cadence_rpm", it) }
+            cadence?.get(CyclingPedalingCadenceRecord.RPM_MAX)?.let { put("max_cadence_rpm", it) }
+
+            val activeKcal = healthConnectClient.aggregateOrNull(
+                AggregateRequest(
+                    metrics = setOf(ActiveCaloriesBurnedRecord.ACTIVE_CALORIES_TOTAL),
+                    timeRangeFilter = sessionRange,
+                ),
+            )?.get(ActiveCaloriesBurnedRecord.ACTIVE_CALORIES_TOTAL)?.inKilocalories
+            activeKcal?.let { put("active_kcal", it) }
+
+            val totalKcal = healthConnectClient.aggregateOrNull(
+                AggregateRequest(
+                    metrics = setOf(TotalCaloriesBurnedRecord.ENERGY_TOTAL),
+                    timeRangeFilter = sessionRange,
+                ),
+            )?.get(TotalCaloriesBurnedRecord.ENERGY_TOTAL)?.inKilocalories
+            totalKcal?.let { put("total_kcal", it) }
+
+            val totalSteps = healthConnectClient.aggregateOrNull(
+                AggregateRequest(
+                    metrics = setOf(StepsRecord.COUNT_TOTAL),
+                    timeRangeFilter = sessionRange,
+                ),
+            )?.get(StepsRecord.COUNT_TOTAL)
+            totalSteps?.let {
+                put("total_steps", it)
+                if (durationMinutes > 0) put("avg_cadence_spm", it.toDouble() / durationMinutes)
+            }
+        }
+
+        onSensorUpdated(
+            context,
+            exerciseSession,
+            typeSlug,
+            exerciseSession.statelessIcon,
+            attributes = attributes,
         )
     }
 
@@ -962,6 +1148,7 @@ class HealthConnectSensorManager : SensorManager {
                 diastolicBloodPressure,
                 distance,
                 elevationGained,
+                exerciseSession,
                 floorsClimbed,
                 heartRate,
                 heartRateVariability,

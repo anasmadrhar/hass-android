@@ -81,6 +81,8 @@ import io.homeassistant.companion.android.database.settings.WebsocketSetting
 import io.homeassistant.companion.android.sensors.LocationSensorManager
 import io.homeassistant.companion.android.sensors.NotificationSensorManager
 import io.homeassistant.companion.android.sensors.SensorReceiver
+import io.homeassistant.companion.android.sensors.healthconnect.HealthConnectWriteResult
+import io.homeassistant.companion.android.sensors.healthconnect.command.HealthConnectWriteCommandHandler
 import io.homeassistant.companion.android.settings.SettingsActivity
 import io.homeassistant.companion.android.settings.assist.AssistConfigManager
 import io.homeassistant.companion.android.settings.assist.DefaultAssistantManager
@@ -125,6 +127,7 @@ class MessagingManager @Inject constructor(
     private val permissionRequestMediator: PermissionRequestMediator,
     private val assistConfigManager: AssistConfigManager,
     private val defaultAssistantManager: DefaultAssistantManager,
+    private val healthConnectWriteCommandHandler: HealthConnectWriteCommandHandler,
 ) {
     companion object {
         const val APP_PREFIX = "app://"
@@ -190,6 +193,7 @@ class MessagingManager @Inject constructor(
         const val COMMAND_FLASHLIGHT = "command_flashlight"
 
         const val COMMAND_WAKE_WORD_DETECTION = "command_wake_word_detection"
+        const val COMMAND_HEALTH_CONNECT_WRITE = "command_health_connect_write"
 
         // DND commands
         const val DND_PRIORITY_ONLY = "priority_only"
@@ -247,6 +251,7 @@ class MessagingManager @Inject constructor(
             COMMAND_SCREEN_OFF_TIMEOUT,
             COMMAND_FLASHLIGHT,
             COMMAND_WAKE_WORD_DETECTION,
+            COMMAND_HEALTH_CONNECT_WRITE,
         )
         val DND_COMMANDS = listOf(DND_ALARMS_ONLY, DND_ALL, DND_NONE, DND_PRIORITY_ONLY)
         val RM_COMMANDS = listOf(RM_NORMAL, RM_SILENT, RM_VIBRATE)
@@ -615,6 +620,10 @@ class MessagingManager @Inject constructor(
                             }
                         }
 
+                        COMMAND_HEALTH_CONNECT_WRITE -> {
+                            handleHealthConnectWriteCommand(jsonData)
+                        }
+
                         else -> Timber.d("No command received")
                     }
                 }
@@ -642,6 +651,41 @@ class MessagingManager @Inject constructor(
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && channelID != NotificationChannel.DEFAULT_CHANNEL_ID) {
             notificationManagerCompat.deleteNotificationChannel(channelID)
         }
+    }
+
+    /**
+     * Forwards a `command_health_connect_write` payload to
+     * [HealthConnectWriteCommandHandler] and surfaces a notification when the write
+     * fails so an HA-side automation author can see why their write was dropped.
+     *
+     * The success path is intentionally silent — repeating an HA-driven write back
+     * to the user as a notification would be noise. Permission and validation
+     * errors do produce notifications because they almost always require user
+     * action (granting a WRITE permission, fixing the FCM payload).
+     *
+     * The fallback notification rewrites `title`/`message` so the user sees the
+     * actual failure reason (missing permission, invalid payload, …) instead of the
+     * literal `command_health_connect_write` string from the inbound FCM data.
+     */
+    private suspend fun handleHealthConnectWriteCommand(data: Map<String, String>) {
+        val result = healthConnectWriteCommandHandler.handle(data)
+        val (title, body) = when (result) {
+            is HealthConnectWriteResult.Success,
+            is HealthConnectWriteResult.Unavailable,
+            -> return
+            is HealthConnectWriteResult.MissingPermission ->
+                "Health Connect write blocked" to
+                    "Missing permission: ${result.permission}. Grant it from Settings → Sensors → Health Connect."
+            is HealthConnectWriteResult.InvalidPayload ->
+                "Health Connect write rejected" to result.reason
+            is HealthConnectWriteResult.Failure ->
+                "Health Connect write failed" to (result.cause.message ?: result.cause.javaClass.simpleName)
+        }
+        val rewritten = data.toMutableMap().apply {
+            put(NotificationData.TITLE, title)
+            put(NotificationData.MESSAGE, body)
+        }
+        sendNotification(rewritten)
     }
 
     private suspend fun handleDeviceCommands(data: Map<String, String>) {
